@@ -31,9 +31,13 @@
       "js": [ "content-scripts/common.js", "content-scripts/xiaomi-aistudio.js" ],
       "matches": [ "https://aistudio.xiaomimimo.com/*" ],
       "run_at": "document_idle"
+   }, {
+      "js": [ "content-scripts/common.js", "content-scripts/deepseek.js" ],
+      "matches": [ "https://chat.deepseek.com/*" ],
+      "run_at": "document_idle"
    } ],
-   "description": "Queue and auto-send prompts to ChatGPT, Claude, Gemini, AI Studio, and Xiaomi MiMo Studio",
-   "host_permissions": [ "https://chat.openai.com/*", "https://chatgpt.com/*", "https://claude.ai/*", "https://gemini.google.com/*", "https://aistudio.google.com/*", "https://aistudio.xiaomimimo.com/*" ],
+   "description": "Queue and auto-send prompts to ChatGPT, Claude, Gemini, AI Studio, Xiaomi MiMo Studio, and DeepSeek",
+   "host_permissions": [ "https://chat.openai.com/*", "https://chatgpt.com/*", "https://claude.ai/*", "https://gemini.google.com/*", "https://aistudio.google.com/*", "https://aistudio.xiaomimimo.com/*", "https://chat.deepseek.com/*" ],
    "icons": {
       "128": "images/icon-128.png",
       "16": "images/icon-16.png",

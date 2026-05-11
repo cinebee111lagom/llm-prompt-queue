@@ -11,6 +11,7 @@ Queue and automatically send multiple prompts to LLM chat interfaces. This exten
 - **Gemini** (gemini.google.com)
 - **AI Studio** (aistudio.google.com)
 - **Xiaomi MiMo Studio** (aistudio.xiaomimimo.com)
+- **DeepSeek** (chat.deepseek.com)
 
 ## Installation
 
@@ -85,7 +86,8 @@ prompt-queue-extension/
 │   ├── claude.js              # Claude-specific integration
 │   ├── gemini.js              # Gemini-specific integration
 │   ├── aistudio.js            # AI Studio-specific integration
-│   └── xiaomi-aistudio.js     # Xiaomi MiMo Studio-specific integration
+│   ├── xiaomi-aistudio.js     # Xiaomi MiMo Studio-specific integration
+│   └── deepseek.js            # DeepSeek-specific integration
 ├── utils/
 │   └── storage.js             # Storage utility functions
 ├── images/

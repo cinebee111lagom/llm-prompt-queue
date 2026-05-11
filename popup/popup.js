@@ -13,7 +13,8 @@ const SUPPORTED_SITES = [
   { hostname: 'claude.ai', name: 'Claude' },
   { hostname: 'gemini.google.com', name: 'Gemini' },
   { hostname: 'aistudio.google.com', name: 'AI Studio' },
-  { hostname: 'aistudio.xiaomimimo.com', name: 'Xiaomi MiMo Studio' }
+  { hostname: 'aistudio.xiaomimimo.com', name: 'Xiaomi MiMo Studio' },
+  { hostname: 'chat.deepseek.com', name: 'DeepSeek' }
 ];
 
 const STORAGE_KEYS = {

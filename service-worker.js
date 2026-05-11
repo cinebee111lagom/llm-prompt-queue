@@ -24,7 +24,8 @@ const SUPPORTED_SITES = {
   'claude.ai': 'claude',
   'gemini.google.com': 'gemini',
   'aistudio.google.com': 'aistudio',
-  'aistudio.xiaomimimo.com': 'xiaomi_aistudio'
+  'aistudio.xiaomimimo.com': 'xiaomi_aistudio',
+  'chat.deepseek.com': 'deepseek'
 };
 
 /**
