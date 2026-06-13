@@ -29,6 +29,19 @@ const SUPPORTED_SITES = {
 };
 
 /**
+ * Content script bundles for programmatic injection.
+ * Used when manifest scripts are missing (e.g. after extension reload).
+ */
+const CONTENT_SCRIPT_FILES = {
+  chatgpt: ['content-scripts/common.js', 'content-scripts/chatgpt.js'],
+  claude: ['content-scripts/common.js', 'content-scripts/claude.js'],
+  gemini: ['content-scripts/common.js', 'content-scripts/gemini.js'],
+  aistudio: ['content-scripts/common.js', 'content-scripts/aistudio.js'],
+  xiaomi_aistudio: ['content-scripts/common.js', 'content-scripts/xiaomi-aistudio.js'],
+  deepseek: ['content-scripts/common.js', 'content-scripts/deepseek.js']
+};
+
+/**
  * Processing states for the queue coordinator
  */
 const ProcessingState = {
@@ -387,13 +400,70 @@ async function wakeUpTab(tabId) {
 }
 
 /**
+ * Check if an error indicates the content script is not loaded
+ * @param {Error|string} error - Error object or message
+ * @returns {boolean}
+ */
+function isContentScriptConnectionError(error) {
+  const message = error?.message || String(error);
+  return /Receiving end does not exist|Could not establish connection/i.test(message);
+}
+
+/**
+ * Resolve site type for a tab
+ * @param {number} tabId - Tab ID
+ * @returns {Promise<string|null>}
+ */
+async function getSiteTypeForTab(tabId) {
+  const tabSiteMap = stateManager.get('tabSiteMap') || {};
+  if (tabSiteMap[tabId]) {
+    return tabSiteMap[tabId];
+  }
+
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return getSiteFromUrl(tab.url);
+  } catch (error) {
+    logger.warn(`Could not resolve site type for tab ${tabId}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Inject content scripts into a tab when they are missing
+ * @param {number} tabId - Target tab ID
+ * @param {string} siteType - Site identifier
+ * @returns {Promise<void>}
+ */
+async function injectContentScripts(tabId, siteType) {
+  const files = CONTENT_SCRIPT_FILES[siteType];
+  if (!files) {
+    throw new Error(`No content scripts configured for site: ${siteType}`);
+  }
+
+  logger.info(`Injecting content scripts into tab ${tabId} (${siteType})`);
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files
+  });
+
+  // Allow the site script to initialize and register its message listener
+  await new Promise(resolve => setTimeout(resolve, 400));
+}
+
+/**
  * Send a message to a content script in a specific tab
- * Includes wake-up mechanism for background tabs
+ * Includes wake-up mechanism for background tabs and auto-injection fallback
  * @param {number} tabId - Target tab ID
  * @param {Object} message - Message to send
+ * @param {Object} options - Options
+ * @param {boolean} options.allowInject - Whether to inject scripts on connection failure
  * @returns {Promise<any>} Response from content script
  */
-async function sendToContentScript(tabId, message) {
+async function sendToContentScript(tabId, message, options = {}) {
+  const { allowInject = true } = options;
+
   try {
     logger.debug(`Sending to content script (tab ${tabId}):`, message);
 
@@ -412,6 +482,18 @@ async function sendToContentScript(tabId, message) {
     logger.debug(`Response from content script (tab ${tabId}):`, response);
     return response;
   } catch (error) {
+    if (allowInject && isContentScriptConnectionError(error)) {
+      const siteType = await getSiteTypeForTab(tabId);
+
+      if (siteType && CONTENT_SCRIPT_FILES[siteType]) {
+        logger.warn(`Content script missing on tab ${tabId}, injecting for ${siteType}`);
+        await injectContentScripts(tabId, siteType);
+
+        // Retry once after injection
+        return sendToContentScript(tabId, message, { allowInject: false });
+      }
+    }
+
     logger.error(`Failed to send message to tab ${tabId}:`, error);
     throw error;
   }
@@ -500,6 +582,16 @@ class QueueProcessor {
       return;
     }
 
+    // Ensure a processing tab is locked before sending
+    if (!focusManager.getProcessingTab()) {
+      const currentTabId = stateManager.get('currentTabId');
+      const tabSiteMap = stateManager.get('tabSiteMap') || {};
+      if (currentTabId && tabSiteMap[currentTabId]) {
+        focusManager.setProcessingTab(currentTabId);
+        logger.info('Auto-set processing tab in startProcessing:', currentTabId);
+      }
+    }
+
     await this.processNextItem();
   }
 
@@ -573,13 +665,15 @@ class QueueProcessor {
         }
       });
 
-      if (response && response.success) {
+      const wasSubmitted = response?.success && response.submitted === true;
+
+      if (wasSubmitted) {
         logger.info('Prompt injected successfully');
 
         // Update state to waiting for response
         stateManager.set('processingState', ProcessingState.WAITING_FOR_RESPONSE);
 
-        // Remove sent item from queue
+        // Remove sent item from queue only after confirmed submission
         const updatedQueue = queue.slice(1);
         stateManager.set('promptQueue', updatedQueue);
 
@@ -595,6 +689,19 @@ class QueueProcessor {
     } catch (error) {
       logger.error('Error processing queue item:', error);
       stateManager.set('processingState', ProcessingState.IDLE);
+
+      // Put failed item back at the front so it is not lost
+      const currentQueue = stateManager.get('promptQueue') || [];
+      const alreadyQueued = currentQueue.some(item => item.id === nextItem.id);
+      if (!alreadyQueued) {
+        stateManager.set('promptQueue', [nextItem, ...currentQueue]);
+        notifyPopup({
+          type: 'QUEUE_ITEM_RESTORED',
+          item: nextItem,
+          remainingCount: currentQueue.length + 1
+        });
+      }
+
       notifyPopup({
         type: 'PROCESSING_ERROR',
         error: error.message,
@@ -693,7 +800,7 @@ class QueueProcessor {
         }
       });
 
-      if (response && response.success) {
+      if (response?.success && response.submitted === true) {
         logger.info('Prompt injected successfully (manual send)');
         stateManager.set('processingState', ProcessingState.WAITING_FOR_RESPONSE);
 
@@ -714,6 +821,13 @@ class QueueProcessor {
     } catch (error) {
       logger.error('Error sending next item:', error);
       stateManager.set('processingState', ProcessingState.IDLE);
+
+      const currentQueue = stateManager.get('promptQueue') || [];
+      const alreadyQueued = currentQueue.some(item => item.id === nextItem.id);
+      if (!alreadyQueued) {
+        stateManager.set('promptQueue', [nextItem, ...currentQueue]);
+      }
+
       notifyPopup({
         type: 'PROCESSING_ERROR',
         error: error.message,
@@ -1282,11 +1396,20 @@ class MessageRouter {
         notifyPopup({ type: 'GENERATION_STARTED', tabId });
         return { acknowledged: true };
 
-      case ContentMessageType.GENERATION_COMPLETE:
-        // LLM finished generating
+      case ContentMessageType.GENERATION_COMPLETE: {
+        const processingTabId = focusManager.getProcessingTab();
+        if (processingTabId && tabId !== processingTabId) {
+          logger.debug('Ignoring GENERATION_COMPLETE from non-processing tab', {
+            tabId,
+            processingTabId
+          });
+          return { acknowledged: true, ignored: true };
+        }
+
         logger.info('Generation complete on tab:', tabId);
         await queueProcessor.onGenerationComplete();
         return { acknowledged: true };
+      }
 
       case ContentMessageType.ERROR:
         // Something went wrong in content script

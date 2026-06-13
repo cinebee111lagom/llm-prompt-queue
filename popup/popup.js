@@ -555,11 +555,14 @@ async function handleSendNext() {
       type: MessageType.SEND_NEXT
     });
 
-    if (response && response.success) {
+    if (response?.success && response.data?.sent) {
       showStatusMessage('Sending next prompt...', 'info');
       updateStatusIndicator('sending_prompt');
+      loadQueueFromStorage();
     } else {
-      showStatusMessage(response?.error || 'Failed to send prompt', 'error');
+      const errorMsg = response?.data?.error || response?.error || 'Failed to send prompt';
+      showStatusMessage(formatUserError(errorMsg), 'error');
+      loadQueueFromStorage();
     }
   } catch (error) {
     console.error('Error sending next prompt:', error);
@@ -714,6 +717,21 @@ let toastTimeoutId = null;
 let toastCount = 0;
 
 /**
+ * Format extension errors into user-friendly messages
+ * @param {string} error - Raw error message
+ * @returns {string}
+ */
+function formatUserError(error) {
+  const message = error || 'An error occurred';
+
+  if (/Receiving end does not exist|Could not establish connection/i.test(message)) {
+    return '页面未连接扩展脚本，请刷新当前 LLM 页面后重试';
+  }
+
+  return message;
+}
+
+/**
  * Show a temporary status message toast
  * Supports queueing and debouncing of rapid messages
  *
@@ -857,7 +875,7 @@ function setupMessageListener() {
       case 'PROCESSING_ERROR':
       case 'CONTENT_SCRIPT_ERROR':
         updateStatusIndicator('idle');
-        showStatusMessage(message.error || 'An error occurred', 'error');
+        showStatusMessage(formatUserError(message.error), 'error');
         break;
 
       case 'SITE_CONNECTED':
@@ -898,6 +916,11 @@ function handleStateUpdate(payload) {
       loadQueueFromStorage();
       break;
 
+    case 'QUEUE_ITEM_RESTORED':
+      showStatusMessage('Send failed, prompt restored to queue', 'error');
+      loadQueueFromStorage();
+      break;
+
     case 'GENERATION_STARTED':
       updateStatusIndicator('waiting_for_response');
       break;
@@ -918,7 +941,7 @@ function handleStateUpdate(payload) {
 
     case 'PROCESSING_ERROR':
       updateStatusIndicator('idle');
-      showStatusMessage(payload.error || 'Processing error', 'error');
+      showStatusMessage(formatUserError(payload.error), 'error');
       break;
 
     case 'SITE_CONNECTED':

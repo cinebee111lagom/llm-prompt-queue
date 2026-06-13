@@ -434,7 +434,13 @@ function setupMessageListener(handler) {
     Promise.resolve()
       .then(() => handler(message, sender))
       .then(response => {
-        sendResponse({ success: true, ...response });
+        const failed = response && response.error &&
+          response.submitted !== true &&
+          response.monitoring !== true;
+        sendResponse({
+          success: !failed,
+          ...response
+        });
       })
       .catch(error => {
         log.error('Message handler error:', error);
@@ -468,16 +474,17 @@ function startGenerationMonitor(isGeneratingFn, options = {}) {
   const {
     pollInterval = 500,
     timeout = 300000,
-    observeTarget = null
+    observeTarget = null,
+    minWaitTime = 3000,
+    requiredIdleChecks = 4
   } = options;
 
   // Clear any existing monitors
   stopGenerationMonitor();
 
   let consecutiveIdleChecks = 0;
-  const REQUIRED_IDLE_CHECKS = 4; // Require 4 consecutive checks to confirm completion
   const startTime = Date.now();
-  let hasSeenGenerating = false; // Track if we ever saw generation happening
+  let hasSeenGenerating = false;
 
   log.info('Starting generation monitor');
 
@@ -503,15 +510,11 @@ function startGenerationMonitor(isGeneratingFn, options = {}) {
         log.debug('Generation in progress...');
       } else {
         consecutiveIdleChecks++;
-        log.debug(`Generation idle check: ${consecutiveIdleChecks}/${REQUIRED_IDLE_CHECKS} (seen generating: ${hasSeenGenerating})`);
+        log.debug(`Generation idle check: ${consecutiveIdleChecks}/${requiredIdleChecks} (seen generating: ${hasSeenGenerating})`);
 
-        // Only trigger completion if we've seen generation OR enough time has passed
-        // This handles both normal completion and cases where generation finished very quickly
-        const minWaitTime = 3000; // Wait at least 3 seconds before allowing completion
-        const timeElapsed = Date.now() - startTime;
-        const shouldAllowCompletion = hasSeenGenerating || timeElapsed > minWaitTime;
+        const shouldAllowCompletion = hasSeenGenerating || (Date.now() - startTime) > minWaitTime;
 
-        if (consecutiveIdleChecks >= REQUIRED_IDLE_CHECKS && shouldAllowCompletion) {
+        if (consecutiveIdleChecks >= requiredIdleChecks && shouldAllowCompletion) {
           log.info('Generation complete detected');
           stopGenerationMonitor();
           // Reset processing flag before sending completion message

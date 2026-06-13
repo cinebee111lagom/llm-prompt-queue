@@ -3,14 +3,20 @@
  *
  * Handles prompt injection and submission for https://aistudio.xiaomimimo.com/
  *
- * @version 1.0.0
+ * @version 1.0.3
  */
 
 (function() {
   'use strict';
 
+  if (window.__PromptQueue_xiaomi_aistudio_init) {
+    return;
+  }
+  window.__PromptQueue_xiaomi_aistudio_init = true;
+
   const {
     waitForElement,
+    simulateInput,
     clickButton,
     findElement,
     isElementVisible,
@@ -18,6 +24,7 @@
     setupMessageListener,
     startGenerationMonitor,
     sleep,
+    retryDOMOperation,
     log
   } = window.PromptQueueCommon;
 
@@ -26,11 +33,12 @@
   const SELECTORS = {
     input: [
       'textarea[placeholder*="Ask me anything"]',
+      'textarea[placeholder*="Shift+Enter"]',
       'textarea[placeholder*="有问题"]',
       'textarea[placeholder*="输入"]',
       'textarea[placeholder*="Enter"]',
-      'textarea[rows="1"]',
-      'textarea:not([disabled])'
+      'div[contenteditable="true"][role="textbox"]',
+      'div[contenteditable="true"]'
     ],
     sendButton: [
       'button[data-track-id*="send"]',
@@ -48,26 +56,41 @@
     ],
     conversationArea: [
       'main',
-      '#root',
-      '[class*="conversation"]',
-      '[class*="message"]'
+      '[class*="chat-panel"]',
+      '[class*="conversation"]'
     ],
     responseContainer: [
       '[class*="markdown"]',
-      '[class*="message"]',
       '[class*="assistant"]',
-      '[data-message-author-role="assistant"]'
+      '[data-message-author-role="assistant"]',
+      '[class*="message-content"]',
+      '[class*="answer"]'
     ],
     loadingIndicator: [
-      '[class*="loading"]',
+      '[class*="typing"]',
+      '[class*="streaming"]',
       '[class*="generating"]',
       '[class*="spinner"]',
       '[aria-busy="true"]'
-    ]
+    ],
+    messageList: '#message-list',
+    messageActionToolbar: '[class*="group/clip"]',
+    dialogueContainer: '.dialogue-container'
   };
+
+  const SIDEBAR_EXCLUDE_PATTERN = /upload|file|attach|add|plus|voice|record|search|model|new chat|history|menu|settings|sidebar|claw|trial|cookie|agree|cancel|miMo chat|mimo chat/i;
 
   let lastResponseText = '';
   let responseChangeTimestamp = 0;
+  let chatPanelRoot = null;
+
+  /** Tracks message action toolbars to detect MiMo-specific completion */
+  let generationWatch = {
+    startedAt: 0,
+    baselineToolbarCount: 0,
+    expectedToolbarCount: 0,
+    sawStopButton: false
+  };
 
   function isDisabled(el) {
     return !el ||
@@ -76,125 +99,300 @@
       el.classList.contains('disabled');
   }
 
-  function getVisibleTextareas() {
-    return Array.from(document.querySelectorAll('textarea'))
-      .filter(el => isElementVisible(el) && !isDisabled(el));
+  function elementLabel(el) {
+    return [
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || '',
+      el.getAttribute('data-track-id') || '',
+      el.getAttribute('data-track-name') || '',
+      el.textContent || ''
+    ].join(' ').trim();
+  }
+
+  function isInSidebar(el) {
+    if (!el) return false;
+
+    if (el.closest('aside, nav, [class*="sidebar"], [class*="SideBar"], [class*="side-bar"]')) {
+      return true;
+    }
+
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+
+    // MiMo Studio sidebar is a fixed-width left column.
+    return rect.right <= 320 && rect.width <= 320;
+  }
+
+  function getComposerRoot(input) {
+    const target = input || findChatInput();
+    if (!target) return null;
+
+    return target.closest(SELECTORS.dialogueContainer) ||
+      target.closest('form') ||
+      target.closest('[class*="composer"]') ||
+      target.closest('[class*="input-area"]') ||
+      target.closest('[class*="prompt"]') ||
+      target.parentElement?.parentElement?.parentElement ||
+      target.parentElement?.parentElement ||
+      target.parentElement;
+  }
+
+  function getMessageListRoot() {
+    return document.querySelector(SELECTORS.messageList);
+  }
+
+  /**
+   * MiMo renders copy/refresh/feedback icons in a group/clip toolbar
+   * when an assistant message finishes streaming.
+   */
+  function isMessageActionToolbar(el) {
+    if (!el || !isElementVisible(el)) return false;
+
+    const className = String(el.className || '');
+    if (!className.includes('group/clip')) return false;
+
+    const actions = el.querySelectorAll('button, [role="button"]');
+    return actions.length >= 2;
+  }
+
+  function getMessageActionToolbars() {
+    const root = getMessageListRoot();
+    if (!root) return [];
+
+    return Array.from(root.querySelectorAll(SELECTORS.messageActionToolbar))
+      .filter(isMessageActionToolbar);
+  }
+
+  function countCompletedMessages() {
+    return getMessageActionToolbars().length;
+  }
+
+  function beginResponseWatch() {
+    const baseline = countCompletedMessages();
+    generationWatch = {
+      startedAt: Date.now(),
+      baselineToolbarCount: baseline,
+      expectedToolbarCount: baseline + 1,
+      sawStopButton: false
+    };
+    log.debug('Response watch started', generationWatch);
+  }
+
+  function hasNewCompletedMessage() {
+    if (!generationWatch.startedAt) return false;
+    return countCompletedMessages() >= generationWatch.expectedToolbarCount;
+  }
+
+  function isResponseComplete() {
+    if (!generationWatch.startedAt) return false;
+
+    const elapsed = Date.now() - generationWatch.startedAt;
+    if (elapsed < 800) return false;
+
+    if (!hasNewCompletedMessage()) return false;
+
+    // Require evidence that generation actually ran
+    return generationWatch.sawStopButton || elapsed >= 2000;
+  }
+
+  function getMonitorTarget() {
+    return getMessageListRoot() ? SELECTORS.messageList : SELECTORS.conversationArea[0];
+  }
+
+  function resolveChatPanel(input) {
+    const target = input || findChatInput();
+    if (!target) return chatPanelRoot;
+
+    let node = target.parentElement;
+    let best = null;
+
+    for (let depth = 0; depth < 14 && node; depth++) {
+      if (isInSidebar(node)) {
+        node = node.parentElement;
+        continue;
+      }
+
+      const rect = node.getBoundingClientRect();
+      const containsComposer = node.contains(target);
+      const wideEnough = rect.width >= 420;
+      const notFullAppShell = rect.width < window.innerWidth * 0.95 || rect.left > 120;
+
+      if (containsComposer && wideEnough && notFullAppShell) {
+        best = node;
+      }
+
+      node = node.parentElement;
+    }
+
+    chatPanelRoot = best ||
+      target.closest('main') ||
+      document.querySelector('main') ||
+      getComposerRoot(target)?.parentElement ||
+      null;
+
+    return chatPanelRoot;
+  }
+
+  function findChatInput() {
+    const preferred = findElement(SELECTORS.input, { visible: true });
+    if (preferred && !isDisabled(preferred) && !isInSidebar(preferred)) {
+      return preferred;
+    }
+
+    const candidates = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]'))
+      .filter(el => isElementVisible(el) && !isDisabled(el) && !isInSidebar(el));
+
+    const placeholderMatch = candidates.find(el => {
+      const placeholder = el.getAttribute('placeholder') || el.getAttribute('aria-placeholder') || '';
+      return /ask me anything|shift\+enter|有问题|输入/i.test(placeholder);
+    });
+    if (placeholderMatch) return placeholderMatch;
+
+    if (candidates.length === 0) return null;
+
+    // Composer input sits at the bottom of the main chat column.
+    return candidates.sort((a, b) =>
+      b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom
+    )[0];
   }
 
   async function getInputElement() {
-    const preferred = findElement(SELECTORS.input, { visible: true });
-    if (preferred && !isDisabled(preferred)) return preferred;
+    const input = findChatInput();
+    if (input) return input;
 
-    const textareas = getVisibleTextareas();
-    if (textareas.length > 0) {
-      return textareas[textareas.length - 1];
-    }
-
-    return waitForElement(SELECTORS.input, { timeout: 10000, visible: true });
+    return waitForElement(SELECTORS.input, {
+      timeout: 10000,
+      visible: true,
+      parent: resolveChatPanel() || document
+    });
   }
 
   function findSendButtonNearInput(input) {
+    const composer = getComposerRoot(input);
     const containers = [
-      input.closest('form'),
-      input.closest('[class*="input"]'),
-      input.closest('[class*="composer"]'),
+      composer,
+      resolveChatPanel(input),
       input.parentElement?.parentElement?.parentElement,
       input.parentElement?.parentElement,
-      input.parentElement,
-      document
+      input.parentElement
     ].filter(Boolean);
+
+    const inputRect = input.getBoundingClientRect();
 
     for (const container of containers) {
       const selectorMatch = findElement(SELECTORS.sendButton, {
         parent: container,
         visible: true
       });
-      if (selectorMatch && !isDisabled(selectorMatch)) return selectorMatch;
+      if (selectorMatch && !isDisabled(selectorMatch) && !isInSidebar(selectorMatch)) {
+        return selectorMatch;
+      }
 
       const candidates = Array.from(container.querySelectorAll('button'))
-        .filter(btn => isElementVisible(btn) && !isDisabled(btn));
+        .filter(btn => isElementVisible(btn) && !isDisabled(btn) && !isInSidebar(btn));
 
-      const iconButtons = candidates.filter(btn => {
-        const label = [
-          btn.getAttribute('aria-label') || '',
-          btn.getAttribute('title') || '',
-          btn.getAttribute('data-track-id') || '',
-          btn.getAttribute('data-track-name') || '',
-          btn.textContent || ''
-        ].join(' ').toLowerCase();
-
-        if (/upload|file|attach|camera|album|voice|record|search|model|cookie|agree|cancel/.test(label)) {
-          return false;
-        }
+      const sendCandidates = candidates.filter(btn => {
+        const label = elementLabel(btn).toLowerCase();
+        if (SIDEBAR_EXCLUDE_PATTERN.test(label)) return false;
+        if (/stop|abort|停止|中止/.test(label)) return false;
 
         const rect = btn.getBoundingClientRect();
-        const inputRect = input.getBoundingClientRect();
-        const closeToInput = Math.abs(rect.top - inputRect.top) < 180;
+        const nearComposer = Math.abs(rect.bottom - inputRect.bottom) < 96 &&
+          rect.top >= inputRect.top - 48;
+        const onRightSide = rect.left >= inputRect.left + Math.min(120, inputRect.width * 0.25);
         const hasIcon = !!btn.querySelector('svg');
-        const shortText = (btn.textContent || '').trim().length <= 8;
-        const isRightOfInput = rect.left >= inputRect.left;
+        const compact = (btn.textContent || '').trim().length <= 8;
 
-        return closeToInput && isRightOfInput && hasIcon && shortText;
+        return nearComposer && onRightSide && hasIcon && compact;
       });
 
-      if (iconButtons.length > 0) {
-        return iconButtons[iconButtons.length - 1];
+      if (sendCandidates.length > 0) {
+        return sendCandidates.sort((a, b) =>
+          b.getBoundingClientRect().left - a.getBoundingClientRect().left
+        )[0];
       }
     }
 
     return null;
   }
 
-  async function getSendButton(input) {
-    const button = findSendButtonNearInput(input || await getInputElement());
-    if (button) return button;
-    return waitForElement(SELECTORS.sendButton, { timeout: 5000, visible: true });
-  }
-
   function findStopButton() {
-    const direct = findElement(SELECTORS.stopButton, { visible: true });
-    if (direct) return direct;
+    const panel = resolveChatPanel();
+    const searchRoot = panel || document;
 
-    return Array.from(document.querySelectorAll('button'))
-      .find(btn => {
-        if (!isElementVisible(btn)) return false;
-        const text = [
-          btn.getAttribute('aria-label') || '',
-          btn.getAttribute('title') || '',
-          btn.getAttribute('data-track-id') || '',
-          btn.getAttribute('data-track-name') || '',
-          btn.textContent || ''
-        ].join(' ').toLowerCase();
-        return /stop|abort|停止|中止|取消生成/.test(text);
-      }) || null;
+    for (const selector of SELECTORS.stopButton) {
+      const matches = searchRoot.querySelectorAll(selector);
+      for (const btn of matches) {
+        if (isElementVisible(btn) && !isDisabled(btn) && !isInSidebar(btn)) {
+          return btn;
+        }
+      }
+    }
+
+    return Array.from(searchRoot.querySelectorAll('button')).find(btn => {
+      if (!isElementVisible(btn) || isInSidebar(btn)) return false;
+      const text = elementLabel(btn).toLowerCase();
+      return /stop|abort|停止|中止|取消生成/.test(text);
+    }) || null;
   }
 
   function getResponseText() {
-    const containers = [];
+    const panel = resolveChatPanel();
+    if (!panel) return '';
+
+    const composer = getComposerRoot();
+    const nodes = [];
+
     for (const selector of SELECTORS.responseContainer) {
-      containers.push(...document.querySelectorAll(selector));
+      panel.querySelectorAll(selector).forEach(el => {
+        if (isElementVisible(el) && !isInSidebar(el) && (!composer || !composer.contains(el))) {
+          nodes.push(el);
+        }
+      });
     }
 
-    const unique = [...new Set(containers)].filter(isElementVisible);
+    const unique = [...new Set(nodes)];
     if (unique.length > 0) {
-      return unique.map(el => el.textContent || '').join('\n');
+      return unique.map(el => el.textContent || '').join('\n').trim();
     }
 
-    const root = document.querySelector('main') || document.querySelector('#root') || document.body;
-    return root ? root.textContent || '' : '';
+    // Landing page: only track the main content above the composer, not sidebar history.
+    if (composer) {
+      const clone = panel.cloneNode(true);
+      const composerClone = clone.querySelector('textarea, div[contenteditable="true"]');
+      composerClone?.closest('form')?.remove();
+      composerClone?.parentElement?.parentElement?.remove();
+      return (clone.textContent || '').trim();
+    }
+
+    return '';
   }
 
   function isGenerating() {
     const stopButton = findStopButton();
     if (stopButton && isElementVisible(stopButton)) {
+      generationWatch.sawStopButton = true;
       log.debug('isGenerating: stop button found');
       return true;
     }
 
-    const loading = findElement(SELECTORS.loadingIndicator, { visible: true });
-    if (loading) {
-      log.debug('isGenerating: loading indicator found');
-      return true;
+    const panel = resolveChatPanel();
+    if (panel) {
+      for (const selector of SELECTORS.loadingIndicator) {
+        const matches = panel.querySelectorAll(selector);
+        for (const indicator of matches) {
+          if (isElementVisible(indicator) && !isInSidebar(indicator)) {
+            log.debug('isGenerating: loading indicator found');
+            return true;
+          }
+        }
+      }
+    }
+
+    // MiMo-specific: action toolbar (copy/refresh/feedback) appears when done
+    if (isResponseComplete()) {
+      log.debug('isGenerating: message action toolbar detected - complete');
+      return false;
     }
 
     const currentText = getResponseText();
@@ -215,44 +413,54 @@
   }
 
   function resetResponseTracking() {
+    chatPanelRoot = null;
     lastResponseText = getResponseText();
     responseChangeTimestamp = 0;
+    generationWatch = {
+      startedAt: 0,
+      baselineToolbarCount: 0,
+      expectedToolbarCount: 0,
+      sawStopButton: false
+    };
   }
 
   async function injectPrompt(text) {
     log.info('Injecting prompt into Xiaomi MiMo Studio');
-    resetResponseTracking();
 
-    const input = await getInputElement();
-    input.focus();
-    await sleep(100);
+    return retryDOMOperation(async () => {
+      resetResponseTracking();
 
-    const nativeSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLTextAreaElement.prototype,
-      'value'
-    )?.set;
+      const input = await getInputElement();
+      if (!input) {
+        throw new Error('MiMo Studio input element not found');
+      }
 
-    if (nativeSetter) {
-      nativeSetter.call(input, text);
-    } else {
-      input.value = text;
-    }
+      resolveChatPanel(input);
+      input.focus();
+      await sleep(80);
 
-    input.dispatchEvent(new InputEvent('input', {
-      bubbles: true,
-      cancelable: true,
-      inputType: 'insertText',
-      data: text
-    }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent('keyup', {
-      key: 'Unidentified',
-      bubbles: true,
-      cancelable: true
-    }));
+      simulateInput(input, text);
+      input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent('keyup', {
+        key: 'Unidentified',
+        bubbles: true,
+        cancelable: true
+      }));
 
-    await sleep(200);
-    log.info('Prompt injected successfully');
+      await sleep(180);
+
+      const injectedText = input.value || input.textContent || '';
+      if (!injectedText.includes(text.substring(0, Math.min(20, text.length)))) {
+        throw new Error('Prompt text verification failed');
+      }
+
+      log.info('Prompt injected successfully');
+    }, {
+      maxRetries: 3,
+      baseDelay: 500,
+      operationName: 'MiMo Studio prompt injection'
+    });
   }
 
   function submitWithEnter(input) {
@@ -277,26 +485,33 @@
 
   async function submitPrompt() {
     log.info('Submitting prompt');
-    const input = await getInputElement();
 
-    let sendButton = null;
-    for (let i = 0; i < 20; i++) {
-      sendButton = findSendButtonNearInput(input);
-      if (sendButton && !isDisabled(sendButton)) break;
-      await sleep(100);
-    }
+    return retryDOMOperation(async () => {
+      const input = await getInputElement();
+      let sendButton = null;
 
-    if (sendButton && !isDisabled(sendButton)) {
-      const clicked = clickButton(sendButton);
-      if (clicked) {
-        log.info('Prompt submitted via send button');
-        return true;
+      for (let i = 0; i < 30; i++) {
+        sendButton = findSendButtonNearInput(input);
+        if (sendButton && !isDisabled(sendButton)) break;
+        await sleep(100);
       }
-    }
 
-    submitWithEnter(input);
-    log.info('Prompt submitted via Enter key fallback');
-    return true;
+      if (sendButton && !isDisabled(sendButton)) {
+        const clicked = clickButton(sendButton);
+        if (clicked) {
+          log.info('Prompt submitted via send button');
+          return true;
+        }
+      }
+
+      submitWithEnter(input);
+      log.info('Prompt submitted via Enter key fallback');
+      return true;
+    }, {
+      maxRetries: 3,
+      baseDelay: 500,
+      operationName: 'MiMo Studio prompt submission'
+    });
   }
 
   async function handleMessage(message) {
@@ -319,13 +534,17 @@
             return { error: 'Failed to submit prompt' };
           }
 
-          await sleep(1500);
+          beginResponseWatch();
+
+          await sleep(800);
           await sendToBackground('GENERATION_STARTED', { promptId: payload.id });
 
           startGenerationMonitor(isGenerating, {
-            pollInterval: 1000,
+            pollInterval: 500,
             timeout: 300000,
-            observeTarget: SELECTORS.conversationArea[0]
+            minWaitTime: 1500,
+            requiredIdleChecks: 2,
+            observeTarget: getMonitorTarget()
           });
 
           return { submitted: true };
@@ -355,10 +574,13 @@
       case 'START_MONITORING':
         window.PromptQueueCommon.isProcessing = true;
         resetResponseTracking();
+        beginResponseWatch();
         startGenerationMonitor(isGenerating, {
-          pollInterval: 1000,
+          pollInterval: 500,
           timeout: 300000,
-          observeTarget: SELECTORS.conversationArea[0]
+          minWaitTime: 1500,
+          requiredIdleChecks: 2,
+          observeTarget: getMonitorTarget()
         });
         return { monitoring: true };
 
@@ -373,7 +595,8 @@
 
     try {
       await waitForElement(SELECTORS.input, { timeout: 30000, visible: true });
-      log.info('Input textarea found');
+      resolveChatPanel(findChatInput());
+      log.info('Input element found');
     } catch (error) {
       log.warn('Input not found during initialization, page may still be loading');
     }
